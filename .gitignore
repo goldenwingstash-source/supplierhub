@@ -1,0 +1,8 @@
+﻿__pycache__/
+*.pyc
+uploads/*.png
+uploads/*.jpg
+uploads/*.pdf
+kp_*.xlsx
+tunnel.log
+watchdog.log
