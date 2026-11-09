@@ -1,14 +1,7 @@
-services:
+﻿services:
   - type: web
     name: supplierhub
     env: docker
     plan: free
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
-    envVars:
-      - key: SH_DATA
-        value: /app/data
-    disk:
-      name: supplierhub-data
-      mountPath: /app/data
-      sizeGB: 1
