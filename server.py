@@ -30,7 +30,21 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(APP_DIR, "supplierhub.db")
+# папка для данных: на хостинге можно примонтировать диск (SH_DATA=/app/data)
+DATA_DIR = os.environ.get("SH_DATA") or APP_DIR
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except OSError:
+    DATA_DIR = APP_DIR
+DB_PATH = os.path.join(DATA_DIR, "supplierhub.db")
+if not os.path.exists(DB_PATH):
+    bundled = os.path.join(APP_DIR, "supplierhub.db")
+    if os.path.exists(bundled):
+        try:
+            import shutil as _sh
+            _sh.copyfile(bundled, DB_PATH)
+        except OSError:
+            DB_PATH = bundled
 UP_DIR = os.path.join(APP_DIR, "uploads")
 PORT = int(os.environ.get("PORT") or os.environ.get("SH_PORT") or "8000")
 RATE = 16300.0  # сум за 1 USD
@@ -1287,6 +1301,8 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError:
                     oid = None
             return self._send(200, view_order(oid))
+        if path == "/health":
+            return self._send(200, "ok", "text/plain; charset=utf-8")
         if path == "/start":
             return self._send(200, view_start())
         if path == "/download":
