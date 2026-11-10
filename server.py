@@ -1270,7 +1270,8 @@ def view_order(oid=None):
                        f'<div style="width:{pct}%;height:100%;background:#3d8bfd"></div></div>')
                 return page(f"Заявка №{oid}", f"""<div class="card"><b>Заявка №{oid} обрабатывается…</b>
 <div class="muted">Найдено {proc} из {tot or '?'} позиций</div>{bar}
-<div class="muted">Страница обновится сама через 4 секунды.</div></div>
+<div class="muted">Страница обновится сама через 4 секунды.</div>
+<a class="btn gray" href="/order?id={oid}" style="margin-top:10px">Обновить сейчас</a></div>
 <meta http-equiv="refresh" content="4">""", "/order")
             return page(f"Заявка №{oid}", f"""<div class="card"><b>Заявка №{oid}</b>
 <div class="muted">Обработка прервалась. Загрузите файл снова — если повторяется, пришлите файл поменьше.</div>
@@ -1483,6 +1484,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.send_header("Pragma", "no-cache")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
