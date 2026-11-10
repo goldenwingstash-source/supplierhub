@@ -1845,7 +1845,15 @@ def save_settings(form):
 
 def view_settings():
     st = get_settings()
-    body = f"""<div class="card"><b>Хранение данных</b>
+    tpl_list = list_templates()
+    tpl_html = "".join(f"<li>{esc(t)}</li>" for t in tpl_list) or "<li class='muted'>пока нет</li>"
+    body = f"""<div class="card"><b>Шаблоны КП</b>
+<form method="post" action="/template/upload" enctype="multipart/form-data">
+<input type="file" name="file" accept=".docx" required>
+<button>Загрузить шаблон КП</button>
+</form>
+<div class="muted">Загружено:</div><ul style="margin:6px 0 0 18px">{tpl_html}</ul></div>"""
+    body += f"""<div class="card"><b>Хранение данных</b>
 <div class="muted">{esc(storage_mode())}</div></div>"""
     body += """<div class="card"><b>Реквизиты для КП</b>
 <form method="post" action="/settings/save">
@@ -2135,6 +2143,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, data,
                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                               {"Content-Disposition": f'attachment; filename="KP_{oid}.xlsx"'})
+
+        if self.path == "/template/upload":
+            fields, files = parse_multipart(body, ctype)
+            f = files.get("file")
+            if not f:
+                return self._send(400, page("Шаблоны", "<div class='card'>Файл не получен</div>"))
+            fname, data = f
+            if not fname.lower().endswith(".docx"):
+                return self._send(400, page("Шаблоны", "<div class='card'>Нужен файл .docx</div>"))
+            os.makedirs(TEMPLATES_DIR, exist_ok=True)
+            safe = re.sub(r"[^\w\.\- ]+", "_", os.path.basename(fname))[:120]
+            with open(os.path.join(TEMPLATES_DIR, safe), "wb") as fh:
+                fh.write(data)
+            return self._redirect("/settings")
 
         if self.path == "/settings/save":
             form = urllib.parse.parse_qs(body.decode("utf-8", "ignore"))
