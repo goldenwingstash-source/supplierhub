@@ -390,6 +390,10 @@ th { color:var(--dim); font-weight:600; font-size:13px; }
 .badge { display:inline-block; background:#22303f; color:var(--dim); border-radius:6px; padding:2px 7px; font-size:12px; }
 .row { display:flex; gap:10px; flex-wrap:wrap; }
 .row > * { flex:1 1 180px; }
+.drop{border:2px dashed #3d8bfd;border-radius:14px;padding:26px 16px;text-align:center;
+      color:#9cc4ff;background:#0e141b;margin:8px 0;transition:.15s;cursor:pointer}
+.drop.over{background:#12331f;border-color:#2fbf71;color:#2fbf71}
+.drop b{display:block;font-size:17px;margin-bottom:6px}
 @media (max-width:640px){ h1{font-size:16px} main{padding:10px 10px 90px} }
 """
 
@@ -409,6 +413,43 @@ def page(title, body, active=""):
 <link rel="apple-touch-icon" href="/icon.png">
 <title>{html.escape(title)}</title><style>{CSS}</style></head>
 <body><header><h1>SupplierHub</h1><nav>{nav}</nav></header><main>{body}</main></body></html>"""
+
+
+
+DROP_JS = """
+<script>
+(function(){
+  var dz = document.getElementById('drop');
+  var inp = document.getElementById('fileinput');
+  var frm = document.getElementById('frm');
+  if(!dz || !inp || !frm) return;
+  dz.addEventListener('click', function(){ inp.click(); });
+  ['dragenter','dragover'].forEach(function(e){
+    dz.addEventListener(e, function(ev){ ev.preventDefault(); dz.classList.add('over'); });
+  });
+  ['dragleave','dragend'].forEach(function(e){
+    dz.addEventListener(e, function(ev){ ev.preventDefault(); dz.classList.remove('over'); });
+  });
+  dz.addEventListener('drop', function(ev){
+    ev.preventDefault(); dz.classList.remove('over');
+    if (ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files.length) {
+      try { inp.files = ev.dataTransfer.files; } catch(err) {}
+      var b = dz.querySelector('b'), sp = dz.querySelector('span');
+      if (b) b.textContent = ev.dataTransfer.files[0].name;
+      if (sp) sp.textContent = 'Отправляю...';
+      frm.submit();
+    }
+  });
+  inp.addEventListener('change', function(){
+    if (inp.files.length) {
+      var b = dz.querySelector('b'), sp = dz.querySelector('span');
+      if (b) b.textContent = inp.files[0].name;
+      if (sp) sp.textContent = 'Файл выбран - нажмите кнопку ниже';
+    }
+  });
+})();
+</script>
+"""
 
 
 def esc(v):
@@ -773,14 +814,15 @@ def view_upload():
                          LEFT JOIN suppliers s ON s.id=u.supplier_id ORDER BY u.id DESC LIMIT 30""").fetchall()
     con.close()
     opts = "".join(f'<option value="{s["id"]}">{esc(s["name"])}</option>' for s in sups)
-    body = f"""<div class="card"><form method="post" action="/upload/do" enctype="multipart/form-data">
+    body = f"""<div class="card"><form id="frm" method="post" action="/upload/do" enctype="multipart/form-data">
 <label class="muted">Поставщик</label>
 <select name="supplier_id">{opts}</select>
-<label class="muted">Файл прайса: xlsx, pdf, csv, txt</label>
-<input type="file" name="file" accept=".xlsx,.xlsm,.pdf,.csv,.txt" required>
+<div id="drop" class="drop"><b>Перетащи прайс сюда</b>
+<span>или нажми, чтобы выбрать</span></div>
+<input id="fileinput" type="file" name="file" accept=".xlsx,.xlsm,.pdf,.csv,.txt,.png,.jpg,.jpeg" required>
 <button>Загрузить и разобрать</button>
-<div class="muted">Приложение само найдёт колонки «наименование» и «цена».</div>
-</form></div>"""
+<div class="muted">Excel, PDF, CSV, фото. Приложение само найдёт колонки «наименование» и «цена».</div>
+</form></div>""" + DROP_JS
     body += '<div class="card"><table><tr><th>Файл</th><th>Поставщик</th><th>Позиций</th><th>Дата</th></tr>'
     for u in ups:
         body += f"<tr><td>{esc(u['filename'])}</td><td>{esc(u['sup'] or '—')}</td><td>{u['items']}</td><td class='muted'>{esc(u['created'])}</td></tr>"
@@ -1092,13 +1134,14 @@ def view_order(oid=None):
 
     # новая заявка
     body = """<div class="card"><b>Новая заявка</b>
-<form method="post" action="/order/upload" enctype="multipart/form-data">
-<label class="muted">Фото или файл заявки (png, jpg, xlsx, pdf, csv, txt)</label>
-<input type="file" name="file" accept=".png,.jpg,.jpeg,.webp,.xlsx,.xlsm,.pdf,.csv,.txt" required>
+<form id="frm" method="post" action="/order/upload" enctype="multipart/form-data">
+<div id="drop" class="drop"><b>Перетащи файл сюда</b>
+<span>или нажми, чтобы выбрать</span></div>
+<input id="fileinput" type="file" name="file" accept=".png,.jpg,.jpeg,.webp,.xlsx,.xlsm,.pdf,.csv,.txt" required>
 <button>Проверить заявку по базе</button>
 </form>
-<div class="muted">Приложение распознаёт позиции, ищет их в базе поставщиков,
-показывает закупочную цену и предложение.</div></div>"""
+<div class="muted">Фото, PDF, Excel, CSV, TXT. Приложение распознаёт позиции, ищет их в базе
+поставщиков, показывает закупочную цену и предложение.</div></div>""" + DROP_JS
     con = db()
     orders = con.execute("SELECT id, created, filename, total_buy FROM orders ORDER BY id DESC LIMIT 20").fetchall()
     con.close()
