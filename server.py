@@ -637,17 +637,22 @@ def smart_search(q, min_results=4, limit=120):
     for v in variants:
         if len(v) >= 3:
             cand_pos |= index.get(v, set())
+            cand_pos |= index.get(v[:3], set())
+            cand_pos |= index.get(v[:4], set())
     norm_rows = _SEARCH_CACHE.get("norm") or []
     candidates = [(norm_rows[pos], norm_rows[pos]["_nm"]) for pos in cand_pos if pos < len(norm_rows)]
     for r, nm in candidates:
         sc = score_name(nm, variants)
         name_tokens = r.get("_tokens") or nm.split()
-        if q_tokens:
-            hit = sum(1 for qt in q_tokens
+        # покрытие считаем по всем вариантам запроса (латиница/кириллица/синонимы)
+        cov = 0.0
+        for qv in variants:
+            qt_list = qv.split()
+            if not qt_list:
+                continue
+            hit = sum(1 for qt in qt_list
                       if any(_token_similar(qt, nt) >= 0.6 for nt in name_tokens))
-            cov = hit / len(q_tokens)
-        else:
-            cov = 1.0
+            cov = max(cov, hit / len(qt_list))
         if sc <= 0:
             continue
         scored.append({
