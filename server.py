@@ -473,6 +473,93 @@ def esc(v):
 
 # ------------------------- страницы -------------------------
 
+
+# ------------------------- постоянное хранилище (GitHub) -------------------------
+GH_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GH_REPO = os.environ.get("GITHUB_DATA_REPO", "").strip()
+GH_PATH = os.environ.get("GITHUB_DATA_PATH", "supplierhub.db.gz")
+_GH_STATE = {"sha": None, "last": 0.0}
+
+
+def storage_mode():
+    if GH_TOKEN and GH_REPO:
+        return f"GitHub snapshot: {GH_REPO}"
+    return "локальный файл (данные теряются при перезапуске на бесплатном плане)"
+
+
+def _gh_request(method, url, payload=None):
+    data = None
+    headers = {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json",
+               "User-Agent": "SupplierHub"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=60) as r:
+        body = r.read().decode("utf-8", "ignore")
+    return json.loads(body) if body else {}
+
+
+def storage_pull():
+    """Скачивает снапшот базы из репозитория при старте."""
+    if not (GH_TOKEN and GH_REPO):
+        return False
+    url = f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}"
+    try:
+        meta = _gh_request("GET", url)
+        _GH_STATE["sha"] = meta.get("sha")
+        import base64 as _b64
+        raw = _b64.b64decode(meta.get("content", ""))
+        data = gzip.decompress(raw)
+        with open(DB_PATH, "wb") as f:
+            f.write(data)
+        print(f"[storage] база восстановлена из GitHub ({len(data)//1024} КБ)")
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print("[storage] снапшота ещё нет — начнём с текущей базы")
+        else:
+            print("[storage] ошибка чтения:", e)
+    except Exception as e:
+        print("[storage] ошибка чтения:", e)
+    return False
+
+
+def storage_push(force=False):
+    """Сохраняет снапшот базы в репозиторий (с ограничением частоты)."""
+    if not (GH_TOKEN and GH_REPO):
+        return False
+    now = time.time()
+    if not force and now - _GH_STATE["last"] < 20:
+        return False
+    _GH_STATE["last"] = now
+    try:
+        import base64 as _b64
+        with open(DB_PATH, "rb") as f:
+            raw = f.read()
+        payload = {
+            "message": f"data snapshot {datetime.now():%Y-%m-%d %H:%M:%S}",
+            "content": _b64.b64encode(gzip.compress(raw)).decode("ascii"),
+        }
+        if _GH_STATE["sha"]:
+            payload["sha"] = _GH_STATE["sha"]
+        url = f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}"
+        res = _gh_request("PUT", url, payload)
+        _GH_STATE["sha"] = (res.get("content") or {}).get("sha") or _GH_STATE["sha"]
+        print("[storage] снапшот сохранён в GitHub")
+        return True
+    except Exception as e:
+        print("[storage] ошибка записи:", e)
+        return False
+
+
+def storage_touch():
+    """Вызывается после изменений данных."""
+    if GH_TOKEN and GH_REPO:
+        import threading as _th
+        _th.Thread(target=lambda: storage_push(False), daemon=True).start()
+
+
 # ------------------------- умный поиск -------------------------
 RU2LAT = {
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh",
@@ -1117,6 +1204,7 @@ def _process_order(oid, src_path):
         con.execute("UPDATE orders SET status='done' WHERE id=?", (oid,))
         con.commit()
         con.close()
+        storage_touch()
     except Exception as e:
         import traceback as _tb
         try:
@@ -1370,7 +1458,9 @@ def save_settings(form):
 
 def view_settings():
     st = get_settings()
-    body = """<div class="card"><b>Реквизиты для КП</b>
+    body = f"""<div class="card"><b>Хранение данных</b>
+<div class="muted">{esc(storage_mode())}</div></div>"""
+    body += """<div class="card"><b>Реквизиты для КП</b>
 <form method="post" action="/settings/save">
 <label class="muted">Название компании</label>
 <input type="text" name="company_name" value="{cn}">
@@ -1646,6 +1736,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/settings/save":
             form = urllib.parse.parse_qs(body.decode("utf-8", "ignore"))
             save_settings({k: (v[0] if v else "") for k, v in form.items()})
+            storage_touch()
             return self._redirect("/settings")
 
         if self.path == "/supplier/update":
@@ -1725,6 +1816,7 @@ class Handler(BaseHTTPRequestHandler):
             items = uniq
             con.execute("UPDATE uploads SET items=? WHERE id=?", (len(items), up_id))
             invalidate_cache()
+            storage_touch()
             for name, price, cur_code, unit in items:
                 con.execute("INSERT INTO items(upload_id,supplier_id,name,name_lc,price,currency,unit,raw) VALUES(?,?,?,?,?,?,?,?)",
                             (up_id, supplier_id, name, name.lower(), price, cur_code, unit, ""))
@@ -1787,6 +1879,7 @@ if __name__ == "__main__":
         con.close()
         print("SELFTEST OK")
     else:
+        storage_pull()
         # прогреваем базу и индекс в фоне, чтобы первый поиск был быстрым
         import threading as _th
         def _warm():
