@@ -1247,7 +1247,16 @@ def view_order(oid=None):
     if oid:
         order, rows = order_rows(oid)
         if not order:
-            return page("Заявка", "<div class='card'>Заявка не найдена. <a href='/order'>Новая</a></div>")
+            con = db()
+            recent = con.execute("SELECT id, created FROM orders ORDER BY id DESC LIMIT 5").fetchall()
+            con.close()
+            links = " ".join(f'<a href="/order?id={r["id"]}">{r["id"]}</a>' for r in recent) or "нет"
+            return page("Заявка не найдена", f"""<div class="card"><b>Заявка №{oid} не найдена</b>
+<div class="muted">Такое бывает, если сервер перезапускался — на бесплатном хостинге
+данные заявок не сохраняются между перезапусками.<br>
+Загрузи файл заново — обработается за секунды.</div>
+<div style="margin-top:10px">Последние заявки: {links}</div>
+<a class="btn" href="/order" style="margin-top:12px">Новая заявка</a></div>""", "/order")
         status = (order["status"] if "status" in order.keys() else "done") or "done"
         if status == "working":
             # защита: если обработка «зависла» больше 5 минут — помечаем ошибкой
@@ -1310,6 +1319,8 @@ def view_order(oid=None):
 <input id="fileinput" type="file" name="file" accept=".png,.jpg,.jpeg,.webp,.xlsx,.xlsm,.pdf,.csv,.txt" required>
 <button>Проверить заявку по базе</button>
 </form>
+<div class="muted" style="color:#d8a027">На бесплатном хостинге заявки и загруженные прайсы
+живут до перезапуска сервера. Готовое КП скачивай сразу.</div>
 <div class="muted">Фото, PDF, Excel, CSV, TXT. Приложение распознаёт позиции, ищет их в базе
 поставщиков, показывает закупочную цену и предложение.
 Обрабатываются первые 20 позиций — для заявки этого достаточно, а прайс целиком грузите во вкладке «Прайс».</div></div>""" + DROP_JS
