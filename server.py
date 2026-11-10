@@ -50,6 +50,9 @@ PORT = int(os.environ.get("PORT") or os.environ.get("SH_PORT") or "8000")
 RATE = 16300.0  # сум за 1 USD
 os.makedirs(UP_DIR, exist_ok=True)
 
+MAX_UPLOAD_MB = 10
+MAX_ROWS = 15000
+MAX_ORDER_ITEMS = 40
 PRICE_RE = re.compile(r"(\d[\d\s.,]{0,14})\s*(usd|uzs|сум|\$|cny|rmb|юан|元|руб)", re.I)
 HEADER_HINTS = ("наимен", "товар", "описан", "product", "item", "name", "商品", "名称", "описан")
 PRICE_HINTS = ("цена", "стоим", "прайс", "price", "cost", "价格", "单价", "сумм")
@@ -72,7 +75,10 @@ def db():
         markup REAL, total_buy REAL, total_sell REAL, path TEXT)""")
     con.execute("""CREATE TABLE IF NOT EXISTS orders(
         id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, filename TEXT,
-        markup REAL, total_buy REAL, total_sell REAL)""")
+        markup REAL, total_buy REAL, total_sell REAL, status TEXT DEFAULT 'done')""")
+    ocols = [r[1] for r in con.execute("PRAGMA table_info(orders)")]
+    if "status" not in ocols:
+        con.execute("ALTER TABLE orders ADD COLUMN status TEXT DEFAULT 'done'")
     con.execute("""CREATE TABLE IF NOT EXISTS order_items(
         id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER, req_name TEXT,
         qty REAL, match_name TEXT, supplier_id INTEGER, price REAL, currency TEXT, usd REAL)""")
@@ -272,7 +278,12 @@ def parse_price_file(path):
             if len(sheets) == 1:
                 break
         for ws in sheets:
-            rows = list(ws.iter_rows(values_only=True))
+            # не загружаем весь лист в память: идём по строкам потоком
+            rows = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= MAX_ROWS:
+                    break
+                rows.append(row)
             if not rows:
                 continue
             # ищем строку заголовков
@@ -520,6 +531,8 @@ def query_variants(q):
     for v in (base, lat, cyr, base.replace(" ", ""), lat.replace(" ", "")) + tuple(syn_variants):
         if v and v not in out:
             out.append(v)
+        if len(out) >= 6:
+            break
     TRANSLIT_CACHE[key] = out
     return out
 
@@ -546,6 +559,9 @@ def _token_similar(a, b):
         return 1.0 if a == b else 0.0
     if a in b or b in a:
         return 0.9
+    if len(a) > 12 or len(b) > 12:
+        # артикулы и длинные модели: сравниваем начало строки
+        return 0.85 if a[:8] == b[:8] else 0.0
     d = _lev(a, b)
     return max(0.0, 1.0 - d / max(len(a), len(b)))
 
@@ -563,6 +579,8 @@ def score_name(name_norm, variants):
         # полное вхождение строки запроса
         if qv in name_norm:
             best = max(best, 100.0 if len(qv) >= 4 else 80.0)
+            if best >= 100.0:
+                return best
             continue
         # покрытие токенов запроса
         matched = 0.0
@@ -574,6 +592,8 @@ def score_name(name_norm, variants):
         if len(qv) >= 3 and any(len(nt) >= 3 and (qv in nt or nt in qv) for nt in name_tokens):
             cov = min(1.0, cov + 0.15)
         best = max(best, cov * 95.0)
+        if best >= 95.0:
+            break
     return best
 
 
@@ -640,6 +660,12 @@ def smart_search(q, min_results=4, limit=120):
             cand_pos |= index.get(v[:3], set())
             cand_pos |= index.get(v[:4], set())
     norm_rows = _SEARCH_CACHE.get("norm") or []
+    # ограничиваем число кандидатов: частые слова (ddr, 8gb) дают тысячи строк
+    if len(cand_pos) > 1200:
+        fast_vars = [v for v in variants if len(v) >= 4]
+        narrowed = [pos for pos in cand_pos if pos < len(norm_rows)
+                    and any(v in norm_rows[pos]["_nm"] for v in fast_vars)]
+        cand_pos = set(narrowed[:1200]) if narrowed else set(list(cand_pos)[:1200])
     candidates = [(norm_rows[pos], norm_rows[pos]["_nm"]) for pos in cand_pos if pos < len(norm_rows)]
     for r, nm in candidates:
         sc = score_name(nm, variants)
@@ -1005,29 +1031,105 @@ def parse_order_items(path):
     return names
 
 
+
+def fast_match(name, limit=3):
+    """Быстрый подбор для заявки: пересечение слов по индексу, без Левенштейна."""
+    _load_rows_cached()
+    index = _SEARCH_CACHE.get("index") or {}
+    norm_rows = _SEARCH_CACHE.get("norm") or []
+    toks = [t for t in normalize(name).split() if len(t) >= 3][:8]
+    if not toks:
+        return [], "нет слов"
+    hits = {}
+    for t in toks:
+        ids = index.get(t, set()) | index.get(t[:4], set())
+        for pos in ids:
+            hits[pos] = hits.get(pos, 0) + 1
+    if not hits:
+        return [], "нет совпадений"
+    need = 2 if len(toks) >= 2 else 1
+    pool = [pos for pos, c in hits.items() if c >= need] or list(hits.keys())
+    if len(pool) > 1200:
+        pool = sorted(pool, key=lambda p: -hits.get(p, 0))[:1200]
+    out = []
+    for pos in pool:
+        r = norm_rows[pos]
+        row_tokens = set(r.get("_tokens") or [])
+        overlap = len(set(toks) & row_tokens) / max(1, len(toks))
+        out.append({
+            "name": r["name"], "price": r["price"], "cur": r["currency"],
+            "supplier": r["sup"], "country": r["country"],
+            "contact": " · ".join(x for x in [r["contact"], r["phone"], r["email"], r["wechat"]] if x),
+            "phone": r["phone"] or "", "email": r["email"] or "", "wechat": r["wechat"] or "",
+            "person": r["contact"] or "", "file": r["filename"],
+            "score": round(overlap * 100), "usd": (r["price"] or 0) if r["currency"] == "USD"
+                    else round((r["price"] or 0) / RATE, 2),
+            "cov": overlap, "lc": r["name_lc"], "sid": r["supplier_id"],
+        })
+    out.sort(key=lambda x: (-x["cov"], x["usd"]))
+    return [o for o in out if o["cov"] >= 0.2][:limit], "быстрый подбор"
+
+
 def match_item(name, limit=3):
-    """Лучшие предложения из базы по названию из заявки."""
+    """Лучшие предложения из базы по названию из заявки (быстрый путь)."""
+    rows, mode = fast_match(name, limit=limit)
+    if rows:
+        return rows, mode
     rows, mode = smart_search(name, limit=limit)
     return rows[:limit], mode
 
 
+def _process_order(oid, src_path):
+    """Фоновая обработка: разбор файла и подбор цен."""
+    try:
+        items = parse_order_items(src_path)
+        if len(items) > MAX_ORDER_ITEMS:
+            items = items[:MAX_ORDER_ITEMS]
+        rows = []
+        for name, qty in items:
+            matches, _ = match_item(name)
+            best = matches[0] if matches else None
+            rows.append((oid, name, qty,
+                         best["name"] if best else "", best["sid"] if best else None,
+                         best["price"] if best else None, best["cur"] if best else "",
+                         best["usd"] if best else None))
+        con = db()
+        for r in rows:
+            con.execute("""INSERT INTO order_items(order_id,req_name,qty,match_name,supplier_id,
+                           price,currency,usd) VALUES(?,?,?,?,?,?,?,?)""", r)
+        con.execute("UPDATE orders SET status='done' WHERE id=?", (oid,))
+        con.commit()
+        con.close()
+    except Exception as e:
+        import traceback as _tb
+        try:
+            with open(os.path.join(APP_DIR, "order_error.log"), "a", encoding="utf-8") as _f:
+                _f.write(datetime.now().strftime("%H:%M:%S") + " " + repr(e) + "\n")
+                _f.write(_tb.format_exc() + "\n")
+        except OSError:
+            pass
+        print("order processing error:", e)
+        try:
+            con = db()
+            con.execute("UPDATE orders SET status='error' WHERE id=?", (oid,))
+            con.commit()
+            con.close()
+        except Exception:
+            pass
+
+
 def create_order(src_path, supplier_dummy=None):
-    items = parse_order_items(src_path)
     con = db()
-    cur = con.execute("INSERT INTO orders(created,filename,markup,total_buy,total_sell) VALUES(?,?,?,?,?)",
-                      (datetime.now().strftime("%Y-%m-%d %H:%M"), os.path.basename(src_path), 20, 0, 0))
+    cur = con.execute("""INSERT INTO orders(created,filename,markup,total_buy,total_sell,status)
+                         VALUES(?,?,?,?,?,?)""",
+                      (datetime.now().strftime("%Y-%m-%d %H:%M"), os.path.basename(src_path),
+                       20, 0, 0, "working"))
     oid = cur.lastrowid
-    for name, qty in items:
-        matches, _ = match_item(name)
-        best = matches[0] if matches else None
-        con.execute("""INSERT INTO order_items(order_id,req_name,qty,match_name,supplier_id,price,currency,usd)
-                       VALUES(?,?,?,?,?,?,?,?)""",
-                    (oid, name, qty,
-                     best["name"] if best else "", best["sid"] if best else None,
-                     best["price"] if best else None, best["cur"] if best else "",
-                     best["usd"] if best else None))
     con.commit()
     con.close()
+    import threading as _th
+    t = _th.Thread(target=_process_order, args=(oid, src_path), daemon=True)
+    t.start()
     return oid
 
 
@@ -1129,6 +1231,15 @@ def view_order(oid=None):
         order, rows = order_rows(oid)
         if not order:
             return page("Заявка", "<div class='card'>Заявка не найдена. <a href='/order'>Новая</a></div>")
+        status = (order["status"] if "status" in order.keys() else "done") or "done"
+        if status == "working":
+            return page(f"Заявка №{oid}", f"""<div class="card"><b>Заявка №{oid} обрабатывается…</b>
+<div class="muted">Распознаю позиции и ищу их в базе. Страница обновится сама.</div></div>
+<meta http-equiv="refresh" content="4">""", "/order")
+        if status == "error":
+            return page(f"Заявка №{oid}", f"""<div class="card"><b>Не удалось разобрать файл</b>
+<div class="muted">Пришлите файл поменьше или Excel без картинок.</div>
+<a class="btn" href="/order">Новая заявка</a></div>""", "/order")
         total = sum((it["usd"] or 0) for it in rows)
         body += f"""<div class="card"><b>Заявка №{oid}</b>
 <div class="muted">файл: {esc(order['filename'])} · позиций: {len(rows)} · закупка: {total:,.2f} USD</div></div>
@@ -1160,16 +1271,17 @@ def view_order(oid=None):
 <button>Проверить заявку по базе</button>
 </form>
 <div class="muted">Фото, PDF, Excel, CSV, TXT. Приложение распознаёт позиции, ищет их в базе
-поставщиков, показывает закупочную цену и предложение.</div></div>""" + DROP_JS
+поставщиков, показывает закупочную цену и предложение.
+Если в файле больше 40 позиций — обработаются первые 40 (заявка, а не прайс).</div></div>""" + DROP_JS
     con = db()
-    orders = con.execute("SELECT id, created, filename, total_buy FROM orders ORDER BY id DESC LIMIT 20").fetchall()
+    orders = con.execute("SELECT id, created, filename, total_buy, status FROM orders ORDER BY id DESC LIMIT 20").fetchall()
     con.close()
     if orders:
         body += '<div class="card"><b>Последние заявки</b><table><tr><th>№</th><th>Дата</th><th>Файл</th><th>Закупка</th></tr>'
         for o in orders:
             body += (f'<tr><td><a href="/order?id={o["id"]}">{o["id"]}</a></td>'
                      f'<td class="muted">{esc(o["created"])}</td><td>{esc(o["filename"])}</td>'
-                     f'<td class="p">{("%.2f" % o["total_buy"]) if o["total_buy"] else "—"}</td></tr>')
+                     f'<td class="p">{("%.2f" % o["total_buy"]) if o["total_buy"] else ("обработка…" if (o["status"] == "working") else "—")}</td></tr>')
         body += "</table></div>"
     return page("Заявка", body, "/order")
 
@@ -1443,11 +1555,21 @@ class Handler(BaseHTTPRequestHandler):
             if not f:
                 return self._send(400, page("Заявка", "<div class='card'>Файл не получен</div>"))
             fname, data = f
+            if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
+                return self._send(413, page("Заявка",
+                    f"<div class='card'>Файл больше {MAX_UPLOAD_MB} МБ.<br>"
+                    "Такие файлы обычно содержат картинки — сохраните прайс без фото "
+                    "(Excel → Сохранить как → без изображений) или пришлите только нужный лист.</div>"))
             safe = re.sub(r"[^\w\.\-]+", "_", os.path.basename(fname))[:120]
             dest = os.path.join(UP_DIR, f"order_{datetime.now():%Y%m%d_%H%M%S}_{safe}")
             with open(dest, "wb") as fh:
                 fh.write(data)
-            oid = create_order(dest)
+            try:
+                oid = create_order(dest)
+            except Exception as e:
+                return self._send(500, page("Заявка",
+                    f"<div class='card'>Не удалось разобрать файл: {esc(str(e)[:200])}<br>"
+                    "Попробуйте Excel без картинок или файл поменьше.</div>"))
             return self._redirect(f"/order?id={oid}")
 
         if self.path == "/order/kp":
@@ -1504,6 +1626,9 @@ class Handler(BaseHTTPRequestHandler):
             if not f:
                 return self._send(400, page("Ошибка", "<div class='card'>Файл не получен</div>"))
             fname, data = f
+            if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
+                return self._send(413, page("Прайс",
+                    f"<div class='card'>Файл больше {MAX_UPLOAD_MB} МБ — уменьшите его или уберите фото из прайса.</div>"))
             safe = re.sub(r"[^\w\.\-]+", "_", os.path.basename(fname))[:120]
             dest = os.path.join(UP_DIR, f"{datetime.now():%Y%m%d_%H%M%S}_{safe}")
             with open(dest, "wb") as fh:
@@ -1520,10 +1645,19 @@ class Handler(BaseHTTPRequestHandler):
                     pass
                 return self._redirect("/upload?dup=1")
             ext_low = os.path.splitext(dest)[1].lower()
-            if ext_low in (".png", ".jpg", ".jpeg", ".webp"):
-                items = parse_screenshot(dest)
-            else:
-                items = parse_price_file(dest)
+            try:
+                if ext_low in (".png", ".jpg", ".jpeg", ".webp"):
+                    items = parse_screenshot(dest)
+                else:
+                    items = parse_price_file(dest)
+            except Exception as e:
+                con = db()
+                con.execute("INSERT INTO uploads(created,supplier_id,filename,items,hash) VALUES(?,?,?,?,?)",
+                            (datetime.now().strftime("%Y-%m-%d %H:%M"), supplier_id, safe, 0, "failed"))
+                con.commit()
+                con.close()
+                return self._send(500, page("Прайс",
+                    f"<div class='card'>Не удалось разобрать файл: {esc(str(e)[:200])}</div>"))
             cur = con.execute("INSERT INTO uploads(created,supplier_id,filename,items,hash) VALUES(?,?,?,?,?)",
                               (datetime.now().strftime("%Y-%m-%d %H:%M"), supplier_id, safe, len(items), fhash))
             up_id = cur.lastrowid
