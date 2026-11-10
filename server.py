@@ -598,10 +598,21 @@ def _load_rows_cached():
                           LEFT JOIN uploads u ON u.id=i.upload_id""").fetchall()
     con.close()
     norm_rows = [dict(r) for r in rows]
-    for nr in norm_rows:
-        nr["_nm"] = normalize(nr["name"])
-        nr["_tokens"] = nr["_nm"].split()
-    _SEARCH_CACHE.update({"ts": now, "sig": sig, "rows": rows, "norm": norm_rows})
+    index = {}
+    for pos, nr in enumerate(norm_rows):
+        nm = normalize(nr["name"])
+        nr["_nm"] = nm
+        tokens = nm.split()
+        nr["_tokens"] = tokens
+        nr["_pos"] = pos
+        for t in tokens:
+            if len(t) < 3:
+                continue
+            index.setdefault(t, set()).add(pos)
+            if len(t) > 3:
+                index.setdefault(t[:3], set()).add(pos)
+                index.setdefault(t[:4], set()).add(pos)
+    _SEARCH_CACHE.update({"ts": now, "sig": sig, "rows": rows, "norm": norm_rows, "index": index})
     return rows
 
 
@@ -615,16 +626,19 @@ def smart_search(q, min_results=4, limit=120):
     variants = query_variants(q)
     q_tokens = normalize(q).split()
     scored = []
-    # быстрый предфильтр: точное вхождение хотя бы одного варианта запроса
-    fast_variants = [v for v in variants if len(v) >= 3]
+    # кандидаты через инвертированный индекс (без перебора всех 5000+ строк)
+    index = _SEARCH_CACHE.get("index") or {}
     q_tokens_all = [t for t in normalize(q).split() if len(t) >= 3]
-    candidates = []
-    for r in rows:
-        nm = r.get("_nm") or normalize(r["name"])
-        if not nm:
-            continue
-        if any(v in nm for v in fast_variants) or any(t[:4] in nm for t in q_tokens_all):
-            candidates.append((r, nm))
+    cand_pos = set()
+    for t in q_tokens_all:
+        cand_pos |= index.get(t, set())
+        cand_pos |= index.get(t[:3], set())
+        cand_pos |= index.get(t[:4], set())
+    for v in variants:
+        if len(v) >= 3:
+            cand_pos |= index.get(v, set())
+    norm_rows = _SEARCH_CACHE.get("norm") or []
+    candidates = [(norm_rows[pos], norm_rows[pos]["_nm"]) for pos in cand_pos if pos < len(norm_rows)]
     for r, nm in candidates:
         sc = score_name(nm, variants)
         name_tokens = r.get("_tokens") or nm.split()
@@ -1581,6 +1595,14 @@ if __name__ == "__main__":
         con.close()
         print("SELFTEST OK")
     else:
+        # прогреваем базу и индекс в фоне, чтобы первый поиск был быстрым
+        import threading as _th
+        def _warm():
+            try:
+                _load_rows_cached()
+            except Exception as e:
+                print("warmup error:", e)
+        _th.Thread(target=_warm, daemon=True).start()
         srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
         ip = local_ip()
         print("=" * 60)
