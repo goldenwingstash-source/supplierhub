@@ -52,7 +52,7 @@ os.makedirs(UP_DIR, exist_ok=True)
 
 MAX_UPLOAD_MB = 10
 MAX_ROWS = 15000
-MAX_ORDER_ITEMS = 40
+MAX_ORDER_ITEMS = 20
 PRICE_RE = re.compile(r"(\d[\d\s.,]{0,14})\s*(usd|uzs|сум|\$|cny|rmb|юан|元|руб)", re.I)
 HEADER_HINTS = ("наимен", "товар", "описан", "product", "item", "name", "商品", "名称", "описан")
 PRICE_HINTS = ("цена", "стоим", "прайс", "price", "cost", "价格", "单价", "сумм")
@@ -79,6 +79,10 @@ def db():
     ocols = [r[1] for r in con.execute("PRAGMA table_info(orders)")]
     if "status" not in ocols:
         con.execute("ALTER TABLE orders ADD COLUMN status TEXT DEFAULT 'done'")
+    if "processed" not in ocols:
+        con.execute("ALTER TABLE orders ADD COLUMN processed INTEGER DEFAULT 0")
+    if "total" not in ocols:
+        con.execute("ALTER TABLE orders ADD COLUMN total INTEGER DEFAULT 0")
     con.execute("""CREATE TABLE IF NOT EXISTS order_items(
         id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER, req_name TEXT,
         qty REAL, match_name TEXT, supplier_id INTEGER, price REAL, currency TEXT, usd REAL)""")
@@ -1085,7 +1089,12 @@ def _process_order(oid, src_path):
         items = parse_order_items(src_path)
         if len(items) > MAX_ORDER_ITEMS:
             items = items[:MAX_ORDER_ITEMS]
+        con0 = db()
+        con0.execute("UPDATE orders SET total=? WHERE id=?", (len(items), oid))
+        con0.commit()
+        con0.close()
         rows = []
+        done = 0
         for name, qty in items:
             matches, _ = match_item(name)
             best = matches[0] if matches else None
@@ -1093,6 +1102,14 @@ def _process_order(oid, src_path):
                          best["name"] if best else "", best["sid"] if best else None,
                          best["price"] if best else None, best["cur"] if best else "",
                          best["usd"] if best else None))
+            done += 1
+            try:
+                cp = db()
+                cp.execute("UPDATE orders SET processed=? WHERE id=?", (done, oid))
+                cp.commit()
+                cp.close()
+            except Exception:
+                pass
         con = db()
         for r in rows:
             con.execute("""INSERT INTO order_items(order_id,req_name,qty,match_name,supplier_id,
@@ -1233,9 +1250,31 @@ def view_order(oid=None):
             return page("Заявка", "<div class='card'>Заявка не найдена. <a href='/order'>Новая</a></div>")
         status = (order["status"] if "status" in order.keys() else "done") or "done"
         if status == "working":
-            return page(f"Заявка №{oid}", f"""<div class="card"><b>Заявка №{oid} обрабатывается…</b>
-<div class="muted">Распознаю позиции и ищу их в базе. Страница обновится сама.</div></div>
+            # защита: если обработка «зависла» больше 5 минут — помечаем ошибкой
+            try:
+                from datetime import datetime as _dt
+                started = _dt.strptime(order["created"], "%Y-%m-%d %H:%M")
+                if (_dt.now() - started).total_seconds() > 300:
+                    con = db()
+                    con.execute("UPDATE orders SET status='error' WHERE id=?", (oid,))
+                    con.commit()
+                    con.close()
+                    status = "error"
+            except Exception:
+                pass
+            if status == "working":
+                proc = order["processed"] if "processed" in order.keys() else 0
+                tot = order["total"] if "total" in order.keys() else 0
+                pct = int(proc / tot * 100) if tot else 0
+                bar = (f'<div style="height:10px;background:#22303f;border-radius:6px;overflow:hidden;margin:10px 0">'
+                       f'<div style="width:{pct}%;height:100%;background:#3d8bfd"></div></div>')
+                return page(f"Заявка №{oid}", f"""<div class="card"><b>Заявка №{oid} обрабатывается…</b>
+<div class="muted">Найдено {proc} из {tot or '?'} позиций</div>{bar}
+<div class="muted">Страница обновится сама через 4 секунды.</div></div>
 <meta http-equiv="refresh" content="4">""", "/order")
+            return page(f"Заявка №{oid}", f"""<div class="card"><b>Заявка №{oid}</b>
+<div class="muted">Обработка прервалась. Загрузите файл снова — если повторяется, пришлите файл поменьше.</div>
+<a class="btn" href="/order">Новая заявка</a></div>""", "/order")
         if status == "error":
             return page(f"Заявка №{oid}", f"""<div class="card"><b>Не удалось разобрать файл</b>
 <div class="muted">Пришлите файл поменьше или Excel без картинок.</div>
@@ -1272,7 +1311,7 @@ def view_order(oid=None):
 </form>
 <div class="muted">Фото, PDF, Excel, CSV, TXT. Приложение распознаёт позиции, ищет их в базе
 поставщиков, показывает закупочную цену и предложение.
-Если в файле больше 40 позиций — обработаются первые 40 (заявка, а не прайс).</div></div>""" + DROP_JS
+Обрабатываются первые 20 позиций — для заявки этого достаточно, а прайс целиком грузите во вкладке «Прайс».</div></div>""" + DROP_JS
     con = db()
     orders = con.execute("SELECT id, created, filename, total_buy, status FROM orders ORDER BY id DESC LIMIT 20").fetchall()
     con.close()
