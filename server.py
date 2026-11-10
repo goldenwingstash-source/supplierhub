@@ -1278,6 +1278,41 @@ def apply_choice(oid, form):
     storage_touch()
 
 
+def _backfill_matches(oid, rows):
+    """Если у позиции не сохранены варианты — ищем сейчас и сохраняем."""
+    con = db()
+    changed = False
+    for it in rows:
+        try:
+            has = it["matches"]
+        except (KeyError, IndexError):
+            has = None
+        if has:
+            continue
+        matches, _mode = match_item(it["req_name"], limit=3)
+        if not matches:
+            continue
+        opts = [{"name": m["name"], "supplier": m["supplier"], "sid": m["sid"],
+                 "price": m["price"], "cur": m["cur"], "usd": m["usd"]} for m in matches]
+        best = matches[0]
+        con.execute("""UPDATE order_items SET matches=?, match_name=?, supplier_id=?, price=?,
+                       currency=?, usd=? WHERE id=?""",
+                    (json.dumps(opts, ensure_ascii=False), best["name"], best["sid"],
+                     best["price"], best["cur"], best["usd"], it["id"]))
+        changed = True
+    if changed:
+        con.commit()
+    con.close()
+
+
+def _g(row, key, default=""):
+    try:
+        v = row[key]
+    except (KeyError, IndexError):
+        return default
+    return default if v is None else v
+
+
 def order_rows(oid):
     con = db()
     rows = con.execute("""SELECT oi.*, s.name AS sup, s.phone, s.email, s.wechat, s.contact
@@ -1285,6 +1320,13 @@ def order_rows(oid):
                           WHERE oi.order_id=? ORDER BY oi.id""", (oid,)).fetchall()
     order = con.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
     con.close()
+    if rows:
+        _backfill_matches(oid, rows)
+        con = db()
+        rows = con.execute("""SELECT oi.*, s.name AS sup, s.phone, s.email, s.wechat, s.contact
+                              FROM order_items oi LEFT JOIN suppliers s ON s.id=oi.supplier_id
+                              WHERE oi.order_id=? ORDER BY oi.id""", (oid,)).fetchall()
+        con.close()
     return order, rows
 
 
@@ -1469,6 +1511,179 @@ def make_kp_docx(oid, markup, template_path=None):
     return out
 
 
+
+# ------------------------- КП по шаблонам пользователя -------------------------
+TEMPLATES_DIR = os.path.join(APP_DIR, "kp_templates")
+MONTHS_RU = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+             "августа", "сентября", "октября", "ноября", "декабря"]
+
+
+def list_templates():
+    if not os.path.isdir(TEMPLATES_DIR):
+        return []
+    return sorted(f for f in os.listdir(TEMPLATES_DIR) if f.lower().endswith(".docx"))
+
+
+def fmt_money(v):
+    return f"{v:,.2f}".replace(",", " ").replace(".", ",")
+
+
+def _replace_in_paragraph(p, pattern, value):
+    """Заменяет текст по регулярке, сохраняя оформление параграфа."""
+    import re as _re
+    if not _re.search(pattern, p.text):
+        return False
+    new_text = _re.sub(pattern, value, p.text)
+    if p.runs:
+        p.runs[0].text = new_text
+        for r in p.runs[1:]:
+            r.text = ""
+    else:
+        p.add_run(new_text)
+    return True
+
+
+def _fill_spec_table(doc, rows, number, date_str):
+    """Заполняет таблицу спецификации, сохраняя оформление шаблона."""
+    import copy as _copy
+    import re as _re
+
+    target = None
+    for tb in doc.tables:
+        if not tb.rows:
+            continue
+        head = " ".join(c.text.lower() for c in tb.rows[0].cells)
+        if "наимен" in head:
+            target = tb
+            break
+    if target is None:
+        return False
+
+    headers = [c.text.lower() for c in target.rows[0].cells]
+
+    def col(*keys, exclude=()):
+        for i, h in enumerate(headers):
+            if any(k in h for k in keys) and not any(e in h for e in exclude):
+                return i
+        return None
+
+    c_num = col("№", "н-п", "n ")
+    c_name = col("наимен")
+    c_unit = col("ед")
+    c_qty = col("кол")
+    c_price = col("цена")
+    c_total = col("общ", "итого", "сумма", exclude=("ндс",))
+    c_vat = col("ндс")
+    c_withvat = col("с учёт", "стоимост", exclude=("цена",))
+
+    # ищем строку «Итого», чтобы сохранить её и обновить сумму
+    total_row = None
+    for r in target.rows[1:]:
+        if r.cells and "итого" in r.cells[0].text.lower():
+            total_row = r
+            break
+
+    sample = None
+    for r in target.rows[1:]:
+        if r is total_row:
+            continue
+        sample = r
+        break
+    if sample is None:
+        sample = target.add_row()
+
+    # удаляем старые строки данных (кроме итоговой)
+    for r in list(target.rows[1:]):
+        if r is total_row:
+            continue
+        target._tbl.remove(r._tr)
+
+    grand = 0.0
+    for i, it in enumerate(rows, start=1):
+        new_tr = _copy.deepcopy(sample._tr)
+        target._tbl.append(new_tr)
+        cells = target.rows[-1].cells
+        qty = it["qty"] or 1
+        buy = it["usd"] or 0
+        sell = round(buy * (1 + number / 100.0), 2) if isinstance(number, float) else buy
+        price_uzs = round(sell * RATE, 2)
+        total_uzs = round(price_uzs * qty, 2)
+        grand += total_uzs
+        name = it["match_name"] or it["req_name"]
+        values = {}
+        if c_num is not None:
+            values[c_num] = str(i)
+        if c_name is not None:
+            values[c_name] = name[:120]
+        if c_unit is not None:
+            values[c_unit] = "шт"
+        if c_qty is not None:
+            values[c_qty] = str(int(qty))
+        if c_price is not None:
+            values[c_price] = fmt_money(price_uzs)
+        if c_total is not None:
+            values[c_total] = fmt_money(total_uzs)
+        if c_vat is not None:
+            values[c_vat] = fmt_money(round(total_uzs * 0.12, 2))
+        if c_withvat is not None:
+            values[c_withvat] = fmt_money(round(total_uzs * 1.12, 2))
+        for ci, cell in enumerate(cells):
+            cell.text = values.get(ci, "")
+
+    if total_row is not None:
+        for ci, cell in enumerate(total_row.cells):
+            if c_total is not None and ci >= c_total:
+                cell.text = fmt_money(round(grand * 1.12, 2)) if c_vat is not None else fmt_money(grand)
+    return True
+
+
+def make_kp_template(oid, markup, template_name=None):
+    """КП по шаблону пользователя: его данные не трогаем, меняем номер/дату/спецификацию."""
+    try:
+        from docx import Document
+    except ImportError:
+        return None
+    names = list_templates()
+    if not names:
+        return None
+    tpl_name = template_name if template_name in names else names[0]
+    path = os.path.join(TEMPLATES_DIR, tpl_name)
+    doc = Document(path)
+    order, rows = order_rows(oid)
+    now = datetime.now()
+    new_num = str(oid)
+    date_short = now.strftime("%d.%m.%y")
+    date_long = f"«{now:%d}» {MONTHS_RU[now.month - 1]} {now.year}г."
+
+    for p in doc.paragraphs:
+        _replace_in_paragraph(p, r"«\s*\d{1,2}\s*»\s*[А-Яа-я]+\s*\d{4}\s*г?\.?", date_long)
+        _replace_in_paragraph(p, r"\b\d{2}\.\d{2}\.\d{2,4}\b", date_short)
+        _replace_in_paragraph(p, r"(КП|КПR|КП-)\s*\d+([-/]\d+)?", lambda m: f"{m.group(1)} {new_num}")
+        _replace_in_paragraph(p, r"№\s*\d+([-/]\d+)?", lambda m: f"№ {new_num}")
+        _replace_in_paragraph(p, r"#\s*\d+([-/]\d+)?", lambda m: f"# {new_num}")
+        _replace_in_paragraph(p, r"Исх\s*№:?\s*\S+", lambda m: f"Исх №: {new_num}")
+
+    # те же замены внутри таблиц (номер и дата часто лежат в шапке-таблице)
+    for tb in doc.tables:
+        head = " ".join(c.text.lower() for c in tb.rows[0].cells) if tb.rows else ""
+        if "наимен" in head:
+            continue
+        for row in tb.rows:
+            for cell in row.cells:
+                for cp in cell.paragraphs:
+                    _replace_in_paragraph(cp, r"«\s*\d{1,2}\s*»\s*[А-Яа-я]+\s*\d{4}\s*г?\.?", date_long)
+                    _replace_in_paragraph(cp, r"\b\d{1,2}\s+[А-Яа-я]+\s+\d{4}\s*г?\.?", date_long)
+                    _replace_in_paragraph(cp, r"\b\d{2}\.\d{2}\.\d{2,4}\b", date_short)
+                    _replace_in_paragraph(cp, r"Исх\s*№:?\s*\S+", lambda m: f"Исх №: {new_num}")
+                    _replace_in_paragraph(cp, r"№\s*\d+([-/]\d+)?", lambda m: f"№ {new_num}")
+
+    _fill_spec_table(doc, rows, markup, date_short)
+
+    out = os.path.join(APP_DIR, f"kp_{oid}_{tpl_name}")
+    doc.save(out)
+    return out
+
+
 def view_order(oid=None):
     body = ""
     if oid:
@@ -1522,7 +1737,7 @@ def view_order(oid=None):
 <form method="post" action="/order/apply">
 <input type="hidden" name="id" value="{oid}">
 <div class="card"><table>
-<tr><th>#</th><th>В заявке</th><th>Вариант из базы (выбери)</th><th>Закупка</th><th>Контакт</th></tr>"""
+<tr><th>#</th><th>Клиент просит</th><th>Наше предложение из базы</th><th>Закупка</th><th>Контакт поставщика</th></tr>"""
         for i, it in enumerate(rows, start=1):
             contact = " · ".join(x for x in [it["contact"], it["phone"], it["email"], it["wechat"]] if x)
             try:
@@ -1530,29 +1745,38 @@ def view_order(oid=None):
             except ValueError:
                 opts = []
             if opts:
-                sel = []
                 chosen = it["chosen"] if "chosen" in it.keys() else 0
-                for k, o in enumerate(opts):
-                    label = f"{o.get('supplier','')} — {o.get('price','')} {o.get('cur','')} — {str(o.get('name',''))[:38]}"
-                    mark = " selected" if k == chosen else ""
-                    sel.append(f'<option value="{k}"{mark}>{esc(label)}</option>')
-                picker = f'<select name="sel_{it["id"]}" style="min-width:280px">' + "".join(sel) + "</select>"
-                best = f'<div class="muted" style="margin-top:4px">{esc(it["match_name"] or "—")} · {esc(it["sup"] or "")}</div>'
+                choose = ""
+                if len(opts) > 1:
+                    sel = []
+                    for k, o in enumerate(opts):
+                        label = (f"{o.get('supplier','')} — {('%.2f' % (o.get('usd') or 0))} USD — "
+                                 f"{str(o.get('name',''))[:32]}")
+                        mark = " selected" if k == chosen else ""
+                        sel.append(f'<option value="{k}"{mark}>{esc(label)}</option>')
+                    choose = ('<div class="muted" style="margin-top:4px">другой вариант: '
+                              f'<select name="sel_{it["id"]}">' + "".join(sel) + "</select></div>")
+                picker = (f"{esc(_g(it, 'match_name', '—'))}"
+                          f"<div class='muted'>{esc(_g(it, 'sup'))} · {esc(_g(it, 'currency'))} "
+                          f"{esc(_g(it, 'price'))}</div>{choose}")
             else:
-                picker = '<span class="muted">нет вариантов</span>'
-                best = ""
+                picker = '<span class="muted">не найдено в прайсах</span>'
             body += (f"<tr><td>{i}</td><td>{esc(it['req_name'][:60])}</td>"
-                     f"<td>{picker}{best}</td>"
+                     f"<td>{picker}</td>"
                      f"<td class='p'>{('%.2f' % it['usd']) + ' USD' if it['usd'] else '—'}</td>"
                      f"<td class='muted'>{esc(contact)}</td></tr>")
         body += """</table>
 <button style="margin-top:12px">Сохранить выбранные варианты</button>
 </div></form>"""
+        tpl_names = list_templates()
+        tpl_opts = "".join(f"<option>{esc(t)}</option>" for t in tpl_names) or "<option>стандартный (без шаблона)</option>"
         body += f"""<div class="card"><b>Следующий шаг: сделать КП</b>
 <form method="post" action="/order/kp">
 <input type="hidden" name="id" value="{oid}">
 <label class="muted">Наценка, %</label>
 <input type="text" name="markup" value="20">
+<label class="muted">Шаблон КП</label>
+<select name="template">{tpl_opts}</select>
 <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px">
 <button name="format" value="xlsx">КП в Excel</button>
 <button name="format" value="docx" style="background:#2fbf71;color:#08130c">КП в Word</button>
@@ -1897,7 +2121,8 @@ class Handler(BaseHTTPRequestHandler):
                 markup = 20.0
             fmt = (form.get("format") or ["xlsx"])[0]
             if fmt == "docx":
-                path_docx = make_kp_docx(oid, markup)
+                tpl_choice = (form.get("template") or [""])[0]
+                path_docx = make_kp_template(oid, markup, tpl_choice) or make_kp_docx(oid, markup)
                 if path_docx and os.path.exists(path_docx):
                     with open(path_docx, "rb") as f:
                         data = f.read()
