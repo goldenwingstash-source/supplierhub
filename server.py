@@ -85,7 +85,13 @@ def db():
         con.execute("ALTER TABLE orders ADD COLUMN total INTEGER DEFAULT 0")
     con.execute("""CREATE TABLE IF NOT EXISTS order_items(
         id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER, req_name TEXT,
-        qty REAL, match_name TEXT, supplier_id INTEGER, price REAL, currency TEXT, usd REAL)""")
+        qty REAL, match_name TEXT, supplier_id INTEGER, price REAL, currency TEXT, usd REAL,
+        matches TEXT, chosen INTEGER DEFAULT 0)""")
+    icols = [r[1] for r in con.execute("PRAGMA table_info(order_items)")]
+    if "matches" not in icols:
+        con.execute("ALTER TABLE order_items ADD COLUMN matches TEXT")
+    if "chosen" not in icols:
+        con.execute("ALTER TABLE order_items ADD COLUMN chosen INTEGER DEFAULT 0")
     con.execute("""CREATE TABLE IF NOT EXISTS items(
         id INTEGER PRIMARY KEY AUTOINCREMENT, upload_id INTEGER, supplier_id INTEGER,
         name TEXT, name_lc TEXT, price REAL, currency TEXT, unit TEXT, raw TEXT)""")
@@ -1183,12 +1189,16 @@ def _process_order(oid, src_path):
         rows = []
         done = 0
         for name, qty in items:
-            matches, _ = match_item(name)
+            matches, _ = match_item(name, limit=3)
             best = matches[0] if matches else None
+            opts = []
+            for m in matches:
+                opts.append({"name": m["name"], "supplier": m["supplier"], "sid": m["sid"],
+                             "price": m["price"], "cur": m["cur"], "usd": m["usd"]})
             rows.append((oid, name, qty,
                          best["name"] if best else "", best["sid"] if best else None,
                          best["price"] if best else None, best["cur"] if best else "",
-                         best["usd"] if best else None))
+                         best["usd"] if best else None, json.dumps(opts, ensure_ascii=False), 0))
             done += 1
             try:
                 cp = db()
@@ -1200,7 +1210,7 @@ def _process_order(oid, src_path):
         con = db()
         for r in rows:
             con.execute("""INSERT INTO order_items(order_id,req_name,qty,match_name,supplier_id,
-                           price,currency,usd) VALUES(?,?,?,?,?,?,?,?)""", r)
+                           price,currency,usd,matches,chosen) VALUES(?,?,?,?,?,?,?,?,?,?)""", r)
         con.execute("UPDATE orders SET status='done' WHERE id=?", (oid,))
         con.commit()
         con.close()
@@ -1236,6 +1246,36 @@ def create_order(src_path, supplier_dummy=None):
     t = _th.Thread(target=_process_order, args=(oid, src_path), daemon=True)
     t.start()
     return oid
+
+
+
+def apply_choice(oid, form):
+    """Сохраняет выбранный вариант по каждой позиции."""
+    con = db()
+    rows = con.execute("SELECT id, matches, supplier_id, match_name, price, currency, usd "
+                       "FROM order_items WHERE order_id=?", (oid,)).fetchall()
+    for r in rows:
+        key = f"sel_{r['id']}"
+        if key not in form:
+            continue
+        try:
+            idx = int(form[key])
+        except (TypeError, ValueError):
+            continue
+        try:
+            opts = json.loads(r["matches"] or "[]")
+        except ValueError:
+            opts = []
+        if not opts or idx < 0 or idx >= len(opts):
+            continue
+        o = opts[idx]
+        con.execute("""UPDATE order_items SET match_name=?, supplier_id=?, price=?, currency=?,
+                       usd=?, chosen=? WHERE id=?""",
+                    (o.get("name", ""), o.get("sid"), o.get("price"), o.get("cur"),
+                     o.get("usd"), idx, r["id"]))
+    con.commit()
+    con.close()
+    storage_touch()
 
 
 def order_rows(oid):
@@ -1330,6 +1370,105 @@ def make_kp(oid, markup):
     return out, kp_id
 
 
+
+def make_kp_docx(oid, markup, template_path=None):
+    """КП в Word: по шаблону kp_template.docx (если есть) или стандартный."""
+    try:
+        from docx import Document
+        from docx.shared import Pt
+    except ImportError:
+        return None
+    st = get_settings()
+    order, rows = order_rows(oid)
+
+    def fld(it, *names, default=""):
+        for n in names:
+            try:
+                v = it[n]
+            except (KeyError, IndexError):
+                continue
+            if v not in (None, ""):
+                return v
+        return default
+
+    tpl = template_path or os.path.join(APP_DIR, "kp_template.docx")
+    if os.path.exists(tpl):
+        doc = Document(tpl)
+        repl = {
+            "{{company}}": st["company_name"],
+            "{{inn}}": st["company_inn"],
+            "{{phone}}": st["company_phone"],
+            "{{email}}": st["company_email"],
+            "{{address}}": st["company_address"],
+            "{{kp_number}}": str(oid),
+            "{{date}}": datetime.now().strftime("%d.%m.%Y"),
+            "{{markup}}": f"{markup:.0f}",
+            "{{terms}}": st["kp_terms"],
+        }
+        for p in doc.paragraphs:
+            for key, val in repl.items():
+                if key in p.text:
+                    for run in p.runs:
+                        if key in run.text:
+                            run.text = run.text.replace(key, val)
+        table = doc.tables[0] if doc.tables else None
+        if table is not None and len(table.rows) > 1:
+            proto = table.rows[1]
+            total_sell = 0.0
+            for i, it in enumerate(rows, start=1):
+                buy = it["usd"] or 0
+                sell = round(buy * (1 + markup / 100.0), 2)
+                total_sell += sell * (it["qty"] or 1)
+                cells = proto.cells
+                vals = [str(i), it["req_name"][:80], str(int(it["qty"] or 1)),
+                        fld(it, "match_name", default="—"), fld(it, "sup", "supplier", default="—"),
+                        f"{buy:.2f}", f"{sell:.2f}",
+                        f"{round(sell * (it['qty'] or 1), 2):.2f}"]
+                row = table.add_row()
+                for j, v in enumerate(vals):
+                    if j < len(row.cells):
+                        row.cells[j].text = v
+            table._tbl.remove(proto._tr)
+        out = os.path.join(APP_DIR, f"kp_{oid}_{datetime.now():%Y%m%d_%H%M%S}.docx")
+        doc.save(out)
+        return out
+    # стандартный вид
+    doc = Document()
+    doc.add_heading(st["company_name"], level=2)
+    meta = " · ".join(x for x in [st["company_inn"] and f"ИНН {st['company_inn']}",
+                                  st["company_phone"], st["company_email"], st["company_address"]] if x)
+    if meta:
+        doc.add_paragraph(meta)
+    doc.add_heading(f"Коммерческое предложение № {oid} от {datetime.now():%d.%m.%Y}", level=3)
+    table = doc.add_table(rows=1, cols=8)
+    table.style = "Table Grid"
+    head = ["№", "Наименование", "Кол-во", "Предложение", "Поставщик", "Закупка, USD",
+            "Цена продажи, USD", "Сумма, USD"]
+    for j, h in enumerate(head):
+        table.rows[0].cells[j].text = h
+    total_buy = total_sell = 0.0
+    for i, it in enumerate(rows, start=1):
+        buy = it["usd"] or 0
+        sell = round(buy * (1 + markup / 100.0), 2)
+        qty = it["qty"] or 1
+        total_buy += buy * qty
+        total_sell += sell * qty
+        cells = table.add_row().cells
+        vals = [str(i), str(fld(it, "req_name"))[:80], str(int(qty)),
+                fld(it, "match_name", default="—"), fld(it, "sup", "supplier", default="—"),
+                f"{buy:.2f}", f"{sell:.2f}", f"{sell * qty:.2f}"]
+        for j, v in enumerate(vals):
+            cells[j].text = v
+    doc.add_paragraph("")
+    doc.add_paragraph(f"Итого: {total_sell:.2f} USD   ·   Закупка: {total_buy:.2f} USD   ·   "
+                      f"Прибыль: {total_sell - total_buy:.2f} USD")
+    doc.add_heading("Условия", level=4)
+    doc.add_paragraph(st["kp_terms"])
+    out = os.path.join(APP_DIR, f"kp_{oid}_{datetime.now():%Y%m%d_%H%M%S}.docx")
+    doc.save(out)
+    return out
+
+
 def view_order(oid=None):
     body = ""
     if oid:
@@ -1380,23 +1519,47 @@ def view_order(oid=None):
         total = sum((it["usd"] or 0) for it in rows)
         body += f"""<div class="card"><b>Заявка №{oid}</b>
 <div class="muted">файл: {esc(order['filename'])} · позиций: {len(rows)} · закупка: {total:,.2f} USD</div></div>
+<form method="post" action="/order/apply">
+<input type="hidden" name="id" value="{oid}">
 <div class="card"><table>
-<tr><th>#</th><th>В заявке</th><th>Предложение</th><th>Поставщик</th><th>Закупка</th><th>Контакт</th></tr>"""
+<tr><th>#</th><th>В заявке</th><th>Вариант из базы (выбери)</th><th>Закупка</th><th>Контакт</th></tr>"""
         for i, it in enumerate(rows, start=1):
             contact = " · ".join(x for x in [it["contact"], it["phone"], it["email"], it["wechat"]] if x)
-            body += (f"<tr><td>{i}</td><td>{esc(it['req_name'][:70])}</td>"
-                     f"<td>{esc(it['match_name'] or '—')}</td><td>{esc(it['sup'] or '—')}</td>"
+            try:
+                opts = json.loads(it["matches"] or "[]")
+            except ValueError:
+                opts = []
+            if opts:
+                sel = []
+                chosen = it["chosen"] if "chosen" in it.keys() else 0
+                for k, o in enumerate(opts):
+                    label = f"{o.get('supplier','')} — {o.get('price','')} {o.get('cur','')} — {str(o.get('name',''))[:38]}"
+                    mark = " selected" if k == chosen else ""
+                    sel.append(f'<option value="{k}"{mark}>{esc(label)}</option>')
+                picker = f'<select name="sel_{it["id"]}" style="min-width:280px">' + "".join(sel) + "</select>"
+                best = f'<div class="muted" style="margin-top:4px">{esc(it["match_name"] or "—")} · {esc(it["sup"] or "")}</div>'
+            else:
+                picker = '<span class="muted">нет вариантов</span>'
+                best = ""
+            body += (f"<tr><td>{i}</td><td>{esc(it['req_name'][:60])}</td>"
+                     f"<td>{picker}{best}</td>"
                      f"<td class='p'>{('%.2f' % it['usd']) + ' USD' if it['usd'] else '—'}</td>"
                      f"<td class='muted'>{esc(contact)}</td></tr>")
-        body += "</table></div>"
-        body += f"""<div class="card"><b>Следующий шаг: сделать КП?</b>
+        body += """</table>
+<button style="margin-top:12px">Сохранить выбранные варианты</button>
+</div></form>"""
+        body += f"""<div class="card"><b>Следующий шаг: сделать КП</b>
 <form method="post" action="/order/kp">
 <input type="hidden" name="id" value="{oid}">
-<label class="muted">Какую наценку поставить, %</label>
+<label class="muted">Наценка, %</label>
 <input type="text" name="markup" value="20">
-<button>Сформировать КП</button>
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px">
+<button name="format" value="xlsx">КП в Excel</button>
+<button name="format" value="docx" style="background:#2fbf71;color:#08130c">КП в Word</button>
+</div>
 </form>
-<div class="muted">Считается цена продажи = закупка + наценка, итог и прибыль.</div></div>"""
+<div class="muted">Цена продажи = закупка + наценка. Word формируется по шаблону kp_template.docx,
+если шаблон не загружен — стандартный вид с твоими реквизитами.</div></div>"""
         return page(f"Заявка №{oid}", body, "/order")
 
     # новая заявка
@@ -1715,6 +1878,12 @@ class Handler(BaseHTTPRequestHandler):
                     "Попробуйте Excel без картинок или файл поменьше.</div>"))
             return self._redirect(f"/order?id={oid}")
 
+        if self.path == "/order/apply":
+            form = urllib.parse.parse_qs(body.decode("utf-8", "ignore"))
+            oid = int((form.get("id") or ["0"])[0] or 0)
+            apply_choice(oid, {k: (v[0] if v else "") for k, v in form.items()})
+            return self._redirect(f"/order?id={oid}")
+
         if self.path == "/order/kp":
             if "multipart/form-data" in ctype:
                 form = parse_multipart(body, ctype)[0]
@@ -1726,6 +1895,15 @@ class Handler(BaseHTTPRequestHandler):
                 markup = float((form.get("markup") or ["20"])[0])
             except ValueError:
                 markup = 20.0
+            fmt = (form.get("format") or ["xlsx"])[0]
+            if fmt == "docx":
+                path_docx = make_kp_docx(oid, markup)
+                if path_docx and os.path.exists(path_docx):
+                    with open(path_docx, "rb") as f:
+                        data = f.read()
+                    return self._send(200, data,
+                                      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                      {"Content-Disposition": f'attachment; filename="KP_{oid}.docx"'})
             path_xlsx, kp_id = make_kp(oid, markup)
             with open(path_xlsx, "rb") as fh:
                 data = fh.read()
